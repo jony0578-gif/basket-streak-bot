@@ -1,200 +1,266 @@
 import os
+import time
 import requests
-from telegram import Bot
+from datetime import datetime, timedelta
 
-API_SPORTS_KEY = os.environ["API_SPORTS_KEY"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# =========================
+# CONFIG
+# =========================
 
-BASE = "https://v1.basketball.api-sports.io"
-HEADERS = {"x-apisports-key": API_SPORTS_KEY}
+API_SPORTS_KEY = os.getenv("API_SPORTS_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-LAST_N_GAMES = 15
-TOP_N = 10
+BASE_URL = "https://v1.basketball.api-sports.io"
 
-REQUEST_COUNT = 0
-REQUEST_LIMIT = 98
-
-TARGET_LEAGUES = [
-    ("Spain", "ACB"),
-    ("Turkey", "Super Ligi"),
-    ("Italy", "Lega A"),
+# Лиги (как мы договорились: Испания, Турция, Италия)
+# Важно: league_id должны существовать в API-Basketball
+LEAGUES = [
+    {"country": "Spain", "league_id": 117, "league_name": "ACB"},
+    {"country": "Turkey", "league_id": 116, "league_name": "BSL"},
+    {"country": "Italy", "league_id": 111, "league_name": "LBA"},
 ]
 
-EXCLUDE_WORDS = ["Women", "W", "CBA", "China"]
+TOP_N = 10
+LAST_GAMES_MAX = 15
 
-
-def api_get(path: str, params=None):
-    global REQUEST_COUNT
-
-    REQUEST_COUNT += 1
-    if REQUEST_COUNT > REQUEST_LIMIT:
-        Bot(BOT_TOKEN).send_message(
-            chat_id=CHAT_ID,
-            text=(
-                f"⚠️ Лимит запросов почти исчерпан: {REQUEST_COUNT}>{REQUEST_LIMIT}.\n"
-                f"Останавливаю скрипт, чтобы не сжечь 100 req/day."
-            ),
-        )
-        raise SystemExit(0)
-
-    r = requests.get(f"{BASE}/{path}", headers=HEADERS, params=params, timeout=40)
-    r.raise_for_status()
-    j = r.json()
-
-    if isinstance(j, dict) and j.get("errors"):
-        raise RuntimeError(f"API error: {j['errors']}")
-
-    return j["response"]
-
-
-def pick_target_leagues():
-    leagues = api_get("leagues")
-    found = []
-
-    for country, league_name in TARGET_LEAGUES:
-        best = None
-
-        for l in leagues:
-            cname = (l.get("country") or {}).get("name", "")
-            lname = (l.get("name", "") or "")
-
-            if cname != country:
-                continue
-
-            if any(w.lower() in lname.lower() for w in EXCLUDE_WORDS):
-                continue
-
-            if league_name.lower() in lname.lower():
-                best = l
-                break
-
-        if not best:
-            raise RuntimeError(
-                f"❌ Не нашёл лигу: {country} - {league_name}. "
-                f"Нужно проверить как она называется в API."
-            )
-
-        found.append(best)
-
-    return found
-
-
-def get_latest_season(league_id: int):
-    seasons = api_get("seasons", params={"league": league_id})
-    return max(seasons)
-
-
-def list_teams(league_id: int, season):
-    return api_get("teams", params={"league": league_id, "season": season})
-
-
-def last_games(team_id: int, league_id: int, season):
-    return api_get(
-        "games",
-        params={
-            "league": league_id,
-            "season": season,
-            "team": team_id,
-            "status": "FT",
-            "last": LAST_N_GAMES,
-        },
-    )
-
-
-def safe_quarter(game, side: str, quarter_key: str):
-    try:
-        return game["scores"][side][quarter_key]
-    except Exception:
+# Условие серии: total 1q < 2q (как ты просил)
+def condition_q1_lt_q2(game):
+    q1 = game.get("scores", {}).get("home", {}).get("quarter_1")
+    q1a = game.get("scores", {}).get("away", {}).get("quarter_1")
+    q2 = game.get("scores", {}).get("home", {}).get("quarter_2")
+    q2a = game.get("scores", {}).get("away", {}).get("quarter_2")
+    if None in (q1, q1a, q2, q2a):
         return None
+    total_q1 = q1 + q1a
+    total_q2 = q2 + q2a
+    return total_q1 < total_q2
 
 
-def calc_active_streak_and_freq(games):
+# =========================
+# HELPERS
+# =========================
+
+def api_get(endpoint, params=None, max_retries=3):
     """
-    ACTIVE streak:
-    Count ONLY consecutive games from the most recent backwards,
-    where (Total 1Q < Total 2Q)
+    Universal GET to API-Sports Basketball
     """
-    freq = 0
+    if not API_SPORTS_KEY:
+        raise RuntimeError("API_SPORTS_KEY is empty. Add it to GitHub Secrets.")
+
+    url = f"{BASE_URL}/{endpoint}"
+    headers = {
+        "x-apisports-key": API_SPORTS_KEY
+    }
+
+    for attempt in range(max_retries):
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        try:
+            j = r.json()
+        except Exception:
+            raise RuntimeError(f"API response is not JSON. Status={r.status_code}, Text={r.text[:200]}")
+
+        # API-Sports standard: { "errors": {...}, "response": [...] }
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {j}")
+
+        errors = j.get("errors")
+        if errors:
+            raise RuntimeError(f"API error: {errors}")
+
+        return j.get("response", [])
+
+        # retry fallback
+        time.sleep(1 + attempt)
+
+    raise RuntimeError("API request failed after retries")
+
+
+def telegram_send(text):
+    """
+    Send message to Telegram
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty. Add it to GitHub Secrets.")
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID is empty. Add it to GitHub Secrets.")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, data=payload, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram sendMessage error {r.status_code}: {r.text}")
+
+
+def get_latest_season():
+    """
+    FIXED:
+    Endpoint seasons does NOT support params={"league": ...}
+    So we just fetch all seasons and take the latest.
+    """
+    seasons = api_get("seasons")
+    if not seasons:
+        raise RuntimeError("Seasons list is empty from API.")
+
+    # seasons are usually numbers like 2018,2019,2020...
+    seasons_sorted = sorted(seasons)
+    return seasons_sorted[-1]
+
+
+def get_team_games(league_id, season, team_id, last_n=15):
+    """
+    Load last N finished games for one team in league/season.
+    """
+    params = {
+        "league": league_id,
+        "season": season,
+        "team": team_id,
+        "status": "FT",
+    }
+    games = api_get("games", params=params)
+
+    # Sort by date descending
+    def parse_date(g):
+        # example: "2024-01-13T19:00:00+00:00"
+        ds = g.get("date")
+        if not ds:
+            return datetime.min
+        # cut timezone part for safety
+        try:
+            return datetime.fromisoformat(ds.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min
+
+    games_sorted = sorted(games, key=parse_date, reverse=True)
+    return games_sorted[:last_n]
+
+
+def get_teams(league_id, season):
+    """
+    Get list of teams for league & season
+    """
+    params = {"league": league_id, "season": season}
+    teams = api_get("teams", params=params)
+    return teams
+
+
+def streak_and_freq(games):
+    """
+    Count ACTIVE streak at start of list (latest games first)
+    returns:
+      streak = how many recent games satisfy condition
+      freq = percent within list that satisfy condition
+      usable = how many games actually had quarter data
+    """
     usable = 0
+    ok_count = 0
 
-    # freq: how many hits among last N games
-    for g in games:
-        h1 = safe_quarter(g, "home", "quarter_1")
-        a1 = safe_quarter(g, "away", "quarter_1")
-        h2 = safe_quarter(g, "home", "quarter_2")
-        a2 = safe_quarter(g, "away", "quarter_2")
+    streak = 0
+    streak_active = True
 
-        if None in (h1, a1, h2, a2):
+    for idx, g in enumerate(games):
+        cond = condition_q1_lt_q2(g)
+        if cond is None:
             continue
 
         usable += 1
-        # ✅ NEW CONDITION: 1Q < 2Q
-        if (h1 + a1) < (h2 + a2):
-            freq += 1
+        if cond:
+            ok_count += 1
 
-    # active streak: only consecutive from latest match
-    streak = 0
-    for g in games:
-        h1 = safe_quarter(g, "home", "quarter_1")
-        a1 = safe_quarter(g, "away", "quarter_1")
-        h2 = safe_quarter(g, "home", "quarter_2")
-        a2 = safe_quarter(g, "away", "quarter_2")
+        # streak logic based on latest games order
+        if streak_active:
+            if cond:
+                streak += 1
+            else:
+                streak_active = False
 
-        if None in (h1, a1, h2, a2):
-            break
-
-        # ✅ NEW CONDITION: 1Q < 2Q
-        if (h1 + a1) < (h2 + a2):
-            streak += 1
-        else:
-            break
-
+    freq = (ok_count / usable * 100.0) if usable > 0 else 0.0
     return streak, freq, usable
 
 
+def format_report(top_list):
+    """
+    Build Telegram-friendly message
+    """
+    dt = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = []
+    lines.append(f"🏀 <b>TOP {TOP_N} активных серий</b>")
+    lines.append(f"Условие: <b>Total 1Q &lt; Total 2Q</b>")
+    lines.append(f"Обновлено: <b>{dt}</b>")
+    lines.append("")
+
+    for i, item in enumerate(top_list, start=1):
+        streak = item["streak"]
+        freq = item["freq"]
+        usable = item["usable"]
+        team = item["team_name"]
+        league = item["league"]
+        lines.append(
+            f"{i}) 🔥 <b>{streak}</b> | {freq:.0f}% ({usable} игр) — <b>{team}</b>\n"
+            f"   <i>{league}</i>"
+        )
+
+    return "\n".join(lines)
+
+
+# =========================
+# MAIN
+# =========================
+
 def main():
-    bot = Bot(BOT_TOKEN)
+    season = get_latest_season()
 
-    leagues = pick_target_leagues()
+    candidates = []
 
-    results = []
+    for L in LEAGUES:
+        country = L["country"]
+        league_id = L["league_id"]
+        league_name = L["league_name"]
 
-    for lg in leagues:
-        league_id = lg["id"]
-        league_name = lg.get("name", "")
-        country = (lg.get("country") or {}).get("name", "")
+        teams = get_teams(league_id, season)
 
-        season = get_latest_season(league_id)
-
-        teams = list_teams(league_id, season)
         for t in teams:
-            team_id = t["id"]
-            team_name = t.get("name", "Unknown")
-
-            games = last_games(team_id, league_id, season)
-            if not games:
+            team_id = t.get("id")
+            team_name = t.get("name")
+            if not team_id or not team_name:
                 continue
 
-            streak, freq, usable = calc_active_streak_and_freq(games)
-            results.append((streak, freq, usable, team_name, f"{country} — {league_name}"))
+            games = get_team_games(league_id, season, team_id, last_n=LAST_GAMES_MAX)
 
-    results.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    top = results[:TOP_N]
+            streak, freq, usable = streak_and_freq(games)
+            if usable < 5:
+                continue  # мало данных, пропускаем
 
-    lines = []
-    lines.append("🏀 TOP-10 ACTIVE STREAK: 1Q total < 2Q total")
-    lines.append("Лиги: Spain ACB / Turkey / Italy LBA")
-    lines.append(f"Окно: последние {LAST_N_GAMES} матчей")
-    lines.append("")
+            candidates.append({
+                "country": country,
+                "league": f"{country} — {league_name}",
+                "team_id": team_id,
+                "team_name": team_name,
+                "streak": streak,
+                "freq": freq,
+                "usable": usable,
+            })
 
-    for i, (streak, freq, usable, team, league) in enumerate(top, start=1):
-        lines.append(f"{i}) {team} — streak {streak} | freq {freq}/{usable} ({league})")
+    # Sort by streak desc, then frequency desc
+    candidates_sorted = sorted(
+        candidates,
+        key=lambda x: (x["streak"], x["freq"], x["usable"]),
+        reverse=True
+    )
 
-    lines.append("")
-    lines.append(f"📌 Requests used today: {REQUEST_COUNT}/{REQUEST_LIMIT}")
+    top = candidates_sorted[:TOP_N]
 
-    bot.send_message(chat_id=CHAT_ID, text="\n".join(lines))
+    if not top:
+        telegram_send("⚠️ Нет данных для TOP (проверь сезоны/лиги/лимиты API).")
+        return
+
+    msg = format_report(top)
+    telegram_send(msg)
 
 
 if __name__ == "__main__":
