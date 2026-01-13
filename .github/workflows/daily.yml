@@ -1,15 +1,17 @@
-name: Daily basket streak bot
+name: Daily Basket Streak Bot
 
 on:
-  schedule:
-    - cron: "0 10 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"  # каждый день 09:00 UTC
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -21,7 +23,7 @@ jobs:
 
       - name: Run bot
         env:
-          API_SPORTS_KEY: ${{ secrets.API_SPORTS_KEY }}
+          API_BASKETBALL_KEY: ${{ secrets.API_BASKETBALL_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python run.py
