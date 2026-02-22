@@ -1,249 +1,344 @@
+# run.py
+# Basket Streak Bot: ищет активные серии по условию "total 1Q < total 2Q"
+# Источник данных: API-Sports API-Basketball (v1.basketball.api-sports.io)
+# Отправка: Telegram Bot API (через requests)
+
 import os
+import time
 import requests
 from datetime import datetime, timezone
 
 API_HOST = "https://v1.basketball.api-sports.io"
 
-COUNTRIES = ["Spain", "Turkey", "Italy"]
-LAST_N = 15
-TOP_N = 10
+# ВАЖНО: имена секретов должны совпадать 1-в-1
+API_KEY = os.getenv("API_BASKETBALL_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Фильтры (как и раньше)
-EXCLUDE_CHINA = True
-EXCLUDE_WOMEN = True
+# Настройки
+COUNTRIES = ["Spain", "Italy", "Turkey"]          # страны
+LAST_GAMES_WINDOW = 15                           # окно последних матчей на команду
+MIN_STREAK = 1                                   # серия считается, если >= MIN_STREAK
+TOP_N = 10                                       # сколько команд показывать
+
+# Таймауты
+HTTP_TIMEOUT = 30
 
 
-def api_get(endpoint: str, params: dict | None = None):
-    key = os.getenv("API_BASKETBALL_KEY")
-    if not key:
-        raise RuntimeError("Missing API_BASKETBALL_KEY secret")
+def api_get(endpoint: str, params: dict | None = None) -> dict:
+    """GET к API-Sports с проверкой ошибок."""
+    url = f"{API_HOST}/{endpoint.lstrip('/')}"
+    headers = {
+        "x-rapidapi-key": API_KEY,
+        "x-rapidapi-host": "v1.basketball.api-sports.io",
+    }
+    r = requests.get(url, headers=headers, params=params or {}, timeout=HTTP_TIMEOUT)
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"API error: non-JSON response ({r.status_code}): {r.text[:200]}")
 
-    headers = {"x-apisports-key": key}
-    url = f"{API_HOST}/{endpoint}"
+    if r.status_code != 200:
+        raise RuntimeError(f"API HTTP {r.status_code}: {data}")
 
-    r = requests.get(url, headers=headers, params=params, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-
+    # API-Sports обычно кладёт ошибки сюда
     if isinstance(data, dict) and data.get("errors"):
         raise RuntimeError(f"API error: {data['errors']}")
 
+    return data
+
+
+def telegram_send(text: str) -> None:
+    """Отправка сообщения в Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram sendMessage failed: HTTP {r.status_code} {r.text[:300]}")
+
+
+def get_latest_season() -> int:
+    """
+    В API-Basketball endpoint /seasons обычно НЕ принимает league.
+    Поэтому берём просто максимальный год из списка сезонов.
+    """
+    data = api_get("seasons")
+    seasons = data.get("response", [])
+
+    # seasons может быть список int или str, приводим к int где можно
+    ints = []
+    for s in seasons:
+        try:
+            ints.append(int(s))
+        except Exception:
+            continue
+
+    if not ints:
+        raise RuntimeError("Не удалось получить список сезонов /seasons (пусто или неизвестный формат).")
+
+    return max(ints)
+
+
+def get_leagues(country: str) -> list[dict]:
+    """
+    ВАЖНО: чтобы API реально отдало лиги, часто нужно type=league
+    (иначе может вернуться пусто).
+    """
+    data = api_get("leagues", params={"country": country, "type": "league"})
+    leagues = data.get("response", [])
+    return leagues
+
+
+def get_teams(league_id: int, season: int) -> list[dict]:
+    data = api_get("teams", params={"league": league_id, "season": season})
     return data.get("response", [])
 
 
-def send_telegram(text: str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN secret")
-    if not chat_id:
-        raise RuntimeError("Missing TELEGRAM_CHAT_ID secret")
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    r = requests.post(url, data=payload, timeout=60)
-    r.raise_for_status()
-
-
-def is_excluded(country_name: str, league_name: str) -> bool:
-    name = f"{country_name} {league_name}".lower()
-
-    if EXCLUDE_CHINA and ("china" in name or "cba" in name):
-        return True
-
-    if EXCLUDE_WOMEN:
-        # мягкий фильтр по словам
-        women_words = ["women", "womens", "woman", "fem", "femen", "femenino", "femin", "women's"]
-        if any(w in name for w in women_words):
-            return True
-
-    return False
-
-
-def get_leagues_for_country(country: str):
-    # В basketball API параметр type обязателен: league или cup
-    leagues = api_get("leagues", params={"country": country, "type": "league"})
-    out = []
-    for item in leagues:
-        lg = item.get("league", {})
-        league_id = lg.get("id")
-        league_name = lg.get("name")
-        if not league_id or not league_name:
-            continue
-        if is_excluded(country, league_name):
-            continue
-        out.append((league_id, league_name))
-    return out
-
-
-def get_latest_season_for_league(league_id: int):
-    seasons = api_get("seasons", params={"league": league_id})
-    seasons_int = []
-    for s in seasons:
-        try:
-            seasons_int.append(int(s))
-        except Exception:
-            pass
-    return max(seasons_int) if seasons_int else None
-
-
-def get_teams(league_id: int, season: int):
-    teams = api_get("teams", params={"league": league_id, "season": season})
-    out = []
-    for item in teams:
-        team = item.get("team", {})
-        tid = team.get("id")
-        name = team.get("name")
-        if tid and name:
-            out.append((tid, name))
-    return out
-
-
-def get_last_games(team_id: int, league_id: int, season: int):
-    # last=15 уже вернёт последние матчи
-    games = api_get(
+def get_last_games_with_q(league_id: int, season: int, team_id: int, last_n: int) -> list[dict]:
+    """
+    Берём последние матчи команды.
+    Не все лиги отдают разбивку по четвертям — тогда матч будет без Q1/Q2.
+    """
+    data = api_get(
         "games",
         params={
-            "team": team_id,
             "league": league_id,
             "season": season,
-            "status": "FT",
-            "last": LAST_N,
+            "team": team_id,
+            "last": last_n,
         },
     )
-    # На всякий случай сортировка по date
-    games_sorted = sorted(games, key=lambda g: g.get("date", ""), reverse=True)
-    return games_sorted
+    games = data.get("response", [])
 
-
-def extract_q1_q2_totals(game):
-    """
-    Правильное чтение четвертей для API-Basketball:
-    scores.home.quarter_1, scores.away.quarter_1, scores.home.quarter_2, scores.away.quarter_2
-    """
-    scores = game.get("scores", {})
-    home = scores.get("home", {}) or {}
-    away = scores.get("away", {}) or {}
-
-    h1 = home.get("quarter_1")
-    a1 = away.get("quarter_1")
-    h2 = home.get("quarter_2")
-    a2 = away.get("quarter_2")
-
-    if None in (h1, a1, h2, a2):
-        return None
-
-    try:
-        q1_total = int(h1) + int(a1)
-        q2_total = int(h2) + int(a2)
-    except Exception:
-        return None
-
-    return q1_total, q2_total
-
-
-def calc_active_streak_and_freq(games):
-    """
-    Условие: Total 1Q < Total 2Q
-    - streak: активная серия подряд от последнего матча назад
-    - freq: сколько раз условие выполнено в окне (из матчей, где есть Q1/Q2)
-    - usable: сколько матчей имели данные Q1/Q2
-    """
-    usable = 0
-    hits = 0
-    flags = []
-
+    # Оставляем только завершённые (на всякий)
+    filtered = []
     for g in games:
-        q = extract_q1_q2_totals(g)
-        if not q:
-            continue
-        q1, q2 = q
-        ok = q1 < q2
-        usable += 1
-        hits += 1 if ok else 0
-        flags.append(ok)
+        status = (g.get("status") or {}).get("short") or (g.get("status") or {}).get("long")
+        # часто FT
+        if status in ("FT", "AOT", "FTOT") or status is None:
+            filtered.append(g)
+    return filtered
 
-    # активная серия: идём по flags от самого свежего
-    streak = 0
-    for ok in flags:
-        if ok:
-            streak += 1
+
+def extract_q1_q2_totals(game: dict) -> tuple[int | None, int | None]:
+    """
+    Пытаемся достать total Q1 и total Q2 (home+away) из разных возможных форматов.
+    Возвращает (q1_total, q2_total) или (None, None) если нет данных.
+    """
+    scores = game.get("scores") or {}
+    home = scores.get("home") or {}
+    away = scores.get("away") or {}
+
+    # Формат 1: quarters как dict {"1": 20, "2": 25, ...} или {"1": {"total": 20}, ...}
+    for side in (home, away):
+        if isinstance(side, dict) and "quarters" in side and isinstance(side["quarters"], dict):
+            pass
         else:
+            # нет quarters в этом формате
+            break
+    else:
+        def pick_q(side: dict, q: str) -> int | None:
+            qv = (side.get("quarters") or {}).get(q)
+            if qv is None:
+                return None
+            if isinstance(qv, (int, float)):
+                return int(qv)
+            if isinstance(qv, dict):
+                # иногда {"total": 20}
+                tv = qv.get("total")
+                if isinstance(tv, (int, float)):
+                    return int(tv)
+            return None
+
+        h1, h2 = pick_q(home, "1"), pick_q(home, "2")
+        a1, a2 = pick_q(away, "1"), pick_q(away, "2")
+        if all(v is not None for v in (h1, h2, a1, a2)):
+            return int(h1 + a1), int(h2 + a2)
+
+    # Формат 2: home/away могут быть как {"quarter_1": 20, "quarter_2": 25, ...}
+    def pick_alt(side: dict, key: str) -> int | None:
+        v = side.get(key)
+        if isinstance(v, (int, float)):
+            return int(v)
+        return None
+
+    h1 = pick_alt(home, "quarter_1")
+    h2 = pick_alt(home, "quarter_2")
+    a1 = pick_alt(away, "quarter_1")
+    a2 = pick_alt(away, "quarter_2")
+    if all(v is not None for v in (h1, h2, a1, a2)):
+        return int(h1 + a1), int(h2 + a2)
+
+    return None, None
+
+
+def condition_total_q1_lt_q2(game: dict) -> bool | None:
+    q1, q2 = extract_q1_q2_totals(game)
+    if q1 is None or q2 is None:
+        return None
+    return q1 < q2
+
+
+def compute_active_streak(games_latest_first: list[dict]) -> tuple[int, int, int]:
+    """
+    Считает активную серию по условию на последних матчах (начиная с самого свежего).
+    Возвращает (streak_len, games_with_q, total_games)
+    """
+    streak = 0
+    games_with_q = 0
+    total_games = len(games_latest_first)
+
+    for g in games_latest_first:
+        ok = condition_total_q1_lt_q2(g)
+        if ok is None:
+            # матч без Q1/Q2 — просто пропускаем, но учитываем отдельно
+            continue
+
+        games_with_q += 1
+        if ok:
+            if streak == games_with_q - 1:
+                # продолжаем серию, если все предыдущие "Q-матчи" были успешны
+                streak += 1
+        else:
+            # серия обрывается на первом же "проваленном" матче с квартерами
             break
 
-    return streak, hits, usable
+    return streak, games_with_q, total_games
 
 
-def main():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def main() -> None:
+    # Проверка секретов
+    if not API_KEY:
+        raise RuntimeError("Missing API_BASKETBALL_KEY secret")
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN secret")
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_CHAT_ID secret")
 
-    rows = []  # (streak, hits, usable, team, league_label)
-    diag = {
-        "leagues_used": 0,
-        "teams_scanned": 0,
-        "teams_with_usable": 0,
-        "total_usable_games": 0,
-    }
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    # 1) сезон
+    season = get_latest_season()
+
+    leagues_checked = 0
+    teams_checked = 0
+    teams_with_q_data = 0
+    games_total_with_q = 0
+
+    results = []  # (streak, games_with_q, country, league_name, team_name, league_id, team_id)
+
+    # 2) по странам -> лиги -> команды
     for country in COUNTRIES:
-        leagues = get_leagues_for_country(country)
+        leagues = get_leagues(country)
 
-        for league_id, league_name in leagues:
-            season = get_latest_season_for_league(league_id)
-            if not season:
+        # если API не возвращает лиги — это ключевая проблема
+        if not leagues:
+            continue
+
+        for league_obj in leagues:
+            league = league_obj.get("league") or {}
+            league_id = league.get("id")
+            league_name = league.get("name") or "Unknown League"
+
+            if not isinstance(league_id, int):
                 continue
 
-            diag["leagues_used"] += 1
+            leagues_checked += 1
 
-            teams = get_teams(league_id, season)
-            for team_id, team_name in teams:
-                diag["teams_scanned"] += 1
+            # команды
+            try:
+                teams = get_teams(league_id, season)
+            except Exception:
+                # иногда по текущему сезону команд нет — пропускаем
+                continue
 
-                games = get_last_games(team_id, league_id, season)
-                if not games:
+            for t in teams:
+                team = t.get("team") or {}
+                team_id = team.get("id")
+                team_name = team.get("name") or "Unknown Team"
+                if not isinstance(team_id, int):
                     continue
 
-                streak, hits, usable = calc_active_streak_and_freq(games)
+                teams_checked += 1
 
-                if usable > 0:
-                    diag["teams_with_usable"] += 1
-                    diag["total_usable_games"] += usable
+                # последние матчи
+                try:
+                    games = get_last_games_with_q(league_id, season, team_id, LAST_GAMES_WINDOW)
+                except Exception:
+                    continue
 
-                # ВАЖНО: берём только активные серии (streak>=1)
-                if streak >= 1:
-                    rows.append((streak, hits, usable, team_name, f"{country} — {league_name}"))
+                # сортируем от свежего к старому по дате, если есть
+                def game_ts(g: dict) -> float:
+                    dt = g.get("date")
+                    if isinstance(dt, str):
+                        # API-Sports обычно ISO: "2026-02-22T10:00:00+00:00"
+                        try:
+                            return datetime.fromisoformat(dt.replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            return 0.0
+                    return 0.0
 
-    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    top = rows[:TOP_N]
+                games_sorted = sorted(games, key=game_ts, reverse=True)
 
-    msg = []
-    msg.append(f"🏀 TOP-{TOP_N} ACTIVE STREAK — total 1Q < 2Q")
-    msg.append(f"🕒 {now}")
-    msg.append(f"Окно: последние {LAST_N} матчей")
-    msg.append("")
+                streak, games_with_q, total_games = compute_active_streak(games_sorted)
+
+                if games_with_q > 0:
+                    teams_with_q_data += 1
+                    games_total_with_q += games_with_q
+
+                if streak >= MIN_STREAK:
+                    results.append(
+                        (streak, games_with_q, country, league_name, team_name, league_id, team_id)
+                    )
+
+                # чуть притормозим, чтобы API не ругалось на лимиты
+                time.sleep(0.15)
+
+    # 3) формируем TOP
+    results.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = results[:TOP_N]
+
+    header = (
+        f"<b>TOP-{TOP_N} ACTIVE STREAK — total 1Q &lt; total 2Q</b>\n"
+        f"🕒 {now_utc}\n"
+        f"Сезон: <b>{season}</b>\n"
+        f"Окно: последние <b>{LAST_GAMES_WINDOW}</b> матчей\n\n"
+    )
+
+    diag = (
+        f"Диагностика данных:\n"
+        f"— Лиг просмотрено: <b>{leagues_checked}</b>\n"
+        f"— Команд просмотрено: <b>{teams_checked}</b>\n"
+        f"— Команд с данными Q1/Q2: <b>{teams_with_q_data}</b>\n"
+        f"— Всего матчей с Q1/Q2: <b>{games_total_with_q}</b>\n"
+    )
 
     if not top:
-        msg.append("⚠️ НЕ НАЙДЕНО активных серий (streak>=1).")
-        msg.append("")
-        msg.append("Диагностика данных:")
-        msg.append(f"- Лиг просмотрено: {diag['leagues_used']}")
-        msg.append(f"- Команд просмотрено: {diag['teams_scanned']}")
-        msg.append(f"- Команд с данными Q1/Q2: {diag['teams_with_usable']}")
-        msg.append(f"- Всего матчей с Q1/Q2: {diag['total_usable_games']}")
-        msg.append("")
-        msg.append("Если команд с данными Q1/Q2 почти нет — проблема в том, что API по этим лигам/сезонам не отдаёт четверти.")
-    else:
-        for i, (streak, hits, usable, team, league) in enumerate(top, start=1):
-            msg.append(f"{i}) streak {streak} | freq {hits}/{usable} — {team} ({league})")
+        text = (
+            header
+            + "⚠️ <b>НЕ НАЙДЕНО активных серий</b> (streak ≥ "
+            + str(MIN_STREAK)
+            + ").\n\n"
+            + diag
+            + "\nЕсли <b>лиг/команд = 0</b> — проблема в запросе лиг (страна/type).\n"
+            + "Если <b>Q1/Q2 почти нет</b> — API по этим лигам/сезонам не отдаёт четверти."
+        )
+        telegram_send(text)
+        return
 
-        msg.append("")
-        msg.append("Диагностика данных:")
-        msg.append(f"- Лиг просмотрено: {diag['leagues_used']}")
-        msg.append(f"- Команд просмотрено: {diag['teams_scanned']}")
-        msg.append(f"- Команд с данными Q1/Q2: {diag['teams_with_usable']}")
-        msg.append(f"- Всего матчей с Q1/Q2: {diag['total_usable_games']}")
+    lines = []
+    for i, (streak, games_with_q, country, league_name, team_name, league_id, team_id) in enumerate(top, start=1):
+        lines.append(
+            f"{i}) <b>{streak}</b> / {games_with_q} — {team_name} — {country} — {league_name}"
+        )
 
-    send_telegram("\n".join(msg))
+    text = header + "\n".join(lines) + "\n\n" + diag
+    telegram_send(text)
 
 
 if __name__ == "__main__":
