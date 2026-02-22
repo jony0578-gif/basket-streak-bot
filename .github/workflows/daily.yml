@@ -21,9 +21,7 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run bot
+           - name: Run bot
         env:
-          API_BASKETBALL_KEY: ${{ secrets.API_BASKETBALL_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEASON: "2024"
         run: python run.py
