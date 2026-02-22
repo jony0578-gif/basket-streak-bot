@@ -3,7 +3,7 @@ name: Daily Basket Streak Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"   # каждый день 09:00 UTC
+    - cron: "0 9 * * *"   # каждый день в 09:00 UTC
 
 jobs:
   run:
@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run bot
@@ -26,5 +26,10 @@ jobs:
           API_BASKETBALL_KEY: ${{ secrets.API_BASKETBALL_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
           SEASON: "2024"
+          COUNTRIES: "Spain,Turkey,Italy"
+          WINDOW_LAST_GAMES: "15"
+          DEBUG: "1"
+
         run: python run.py
