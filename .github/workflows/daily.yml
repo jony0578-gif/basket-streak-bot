@@ -26,10 +26,7 @@ jobs:
           API_BASKETBALL_KEY: ${{ secrets.API_BASKETBALL_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          SEASON: "2024"
-          COUNTRIES: "Spain,Turkey,Italy"
-          WINDOW_LAST_GAMES: "15"
-          DEBUG: "1"
-
+          SEASON: "2023"
+          COUNTRIES: "USA,France,Germany"
+          DEBUG: "0"
         run: python run.py
