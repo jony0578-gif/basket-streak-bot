@@ -3,7 +3,7 @@ name: Daily Basket Streak Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"  # каждый день 09:00 UTC
+    - cron: "0 9 * * *"   # каждый день 09:00 UTC
 
 jobs:
   run:
@@ -23,5 +23,8 @@ jobs:
 
       - name: Run bot
         env:
+          API_BASKETBALL_KEY: ${{ secrets.API_BASKETBALL_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEASON: "2024"
         run: python run.py
