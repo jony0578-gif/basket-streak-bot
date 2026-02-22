@@ -1,8 +1,16 @@
 import os
 import requests
-from collections import defaultdict
+from datetime import datetime, timezone
 
 API_HOST = "https://v1.basketball.api-sports.io"
+
+COUNTRIES = ["Spain", "Turkey", "Italy"]
+LAST_N = 15
+TOP_N = 10
+
+# Фильтры (как и раньше)
+EXCLUDE_CHINA = True
+EXCLUDE_WOMEN = True
 
 
 def api_get(endpoint: str, params: dict | None = None):
@@ -14,9 +22,9 @@ def api_get(endpoint: str, params: dict | None = None):
     url = f"{API_HOST}/{endpoint}"
 
     r = requests.get(url, headers=headers, params=params, timeout=60)
+    r.raise_for_status()
     data = r.json()
 
-    # если API вернул ошибки
     if isinstance(data, dict) and data.get("errors"):
         raise RuntimeError(f"API error: {data['errors']}")
 
@@ -24,158 +32,218 @@ def api_get(endpoint: str, params: dict | None = None):
 
 
 def send_telegram(text: str):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secret")
+    if not token:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN secret")
+    if not chat_id:
+        raise RuntimeError("Missing TELEGRAM_CHAT_ID secret")
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
-
-    r = requests.post(url, data=payload, timeout=30)
+    r = requests.post(url, data=payload, timeout=60)
     r.raise_for_status()
 
 
-def get_leagues(country: str):
-    # ВАЖНО: type обязателен и current НЕ существует в basketball API
+def is_excluded(country_name: str, league_name: str) -> bool:
+    name = f"{country_name} {league_name}".lower()
+
+    if EXCLUDE_CHINA and ("china" in name or "cba" in name):
+        return True
+
+    if EXCLUDE_WOMEN:
+        # мягкий фильтр по словам
+        women_words = ["women", "womens", "woman", "fem", "femen", "femenino", "femin", "women's"]
+        if any(w in name for w in women_words):
+            return True
+
+    return False
+
+
+def get_leagues_for_country(country: str):
+    # В basketball API параметр type обязателен: league или cup
     leagues = api_get("leagues", params={"country": country, "type": "league"})
-    result = []
+    out = []
     for item in leagues:
-        league = item.get("league", {})
-        if league.get("id") and league.get("name"):
-            result.append({"id": league["id"], "name": league["name"]})
-    return result
+        lg = item.get("league", {})
+        league_id = lg.get("id")
+        league_name = lg.get("name")
+        if not league_id or not league_name:
+            continue
+        if is_excluded(country, league_name):
+            continue
+        out.append((league_id, league_name))
+    return out
 
 
-def get_latest_season(league_id: int):
+def get_latest_season_for_league(league_id: int):
     seasons = api_get("seasons", params={"league": league_id})
-    if not seasons:
-        return None
-
-    # seasons может быть [2021, 2022, "2023"] → приводим к int
     seasons_int = []
     for s in seasons:
         try:
             seasons_int.append(int(s))
-        except:
+        except Exception:
             pass
-
-    if not seasons_int:
-        return None
-
-    return max(seasons_int)
-
-
-def get_team_games(league_id: int, season: int, team_id: int):
-    # берём последние 15 игр
-    games = api_get("games", params={
-        "league": league_id,
-        "season": season,
-        "team": team_id,
-        "last": 15
-    })
-    return games
+    return max(seasons_int) if seasons_int else None
 
 
 def get_teams(league_id: int, season: int):
     teams = api_get("teams", params={"league": league_id, "season": season})
-    result = []
+    out = []
     for item in teams:
         team = item.get("team", {})
-        if team.get("id") and team.get("name"):
-            result.append({"id": team["id"], "name": team["name"]})
-    return result
+        tid = team.get("id")
+        name = team.get("name")
+        if tid and name:
+            out.append((tid, name))
+    return out
 
 
-def streak_and_freq(games):
-    """
-    УСЛОВИЕ:
-    total 1q < 2q
-
-    streak = текущая активная серия подряд (начинаем с самой свежей игры)
-    freq = сколько раз условие выполнилось в последних 15 матчах
-    """
-
-    def cond(game):
-        scores = game.get("scores", {})
-        q1 = scores.get("quarter_1", {})
-        q2 = scores.get("quarter_2", {})
-
-        # total 1q = home+away
-        t1 = (q1.get("home") or 0) + (q1.get("away") or 0)
-        t2 = (q2.get("home") or 0) + (q2.get("away") or 0)
-
-        return t1 < t2
-
-    # сортируем по дате (самые свежие первые)
+def get_last_games(team_id: int, league_id: int, season: int):
+    # last=15 уже вернёт последние матчи
+    games = api_get(
+        "games",
+        params={
+            "team": team_id,
+            "league": league_id,
+            "season": season,
+            "status": "FT",
+            "last": LAST_N,
+        },
+    )
+    # На всякий случай сортировка по date
     games_sorted = sorted(games, key=lambda g: g.get("date", ""), reverse=True)
+    return games_sorted
 
-    flags = [cond(g) for g in games_sorted]
 
-    # active streak
+def extract_q1_q2_totals(game):
+    """
+    Правильное чтение четвертей для API-Basketball:
+    scores.home.quarter_1, scores.away.quarter_1, scores.home.quarter_2, scores.away.quarter_2
+    """
+    scores = game.get("scores", {})
+    home = scores.get("home", {}) or {}
+    away = scores.get("away", {}) or {}
+
+    h1 = home.get("quarter_1")
+    a1 = away.get("quarter_1")
+    h2 = home.get("quarter_2")
+    a2 = away.get("quarter_2")
+
+    if None in (h1, a1, h2, a2):
+        return None
+
+    try:
+        q1_total = int(h1) + int(a1)
+        q2_total = int(h2) + int(a2)
+    except Exception:
+        return None
+
+    return q1_total, q2_total
+
+
+def calc_active_streak_and_freq(games):
+    """
+    Условие: Total 1Q < Total 2Q
+    - streak: активная серия подряд от последнего матча назад
+    - freq: сколько раз условие выполнено в окне (из матчей, где есть Q1/Q2)
+    - usable: сколько матчей имели данные Q1/Q2
+    """
+    usable = 0
+    hits = 0
+    flags = []
+
+    for g in games:
+        q = extract_q1_q2_totals(g)
+        if not q:
+            continue
+        q1, q2 = q
+        ok = q1 < q2
+        usable += 1
+        hits += 1 if ok else 0
+        flags.append(ok)
+
+    # активная серия: идём по flags от самого свежего
     streak = 0
-    for f in flags:
-        if f:
+    for ok in flags:
+        if ok:
             streak += 1
         else:
             break
 
-    freq = sum(flags)
-    return streak, freq
+    return streak, hits, usable
 
 
 def main():
-    countries = ["Spain", "Turkey", "Italy"]
-    all_rows = []
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    for country in countries:
-        leagues = get_leagues(country)
+    rows = []  # (streak, hits, usable, team, league_label)
+    diag = {
+        "leagues_used": 0,
+        "teams_scanned": 0,
+        "teams_with_usable": 0,
+        "total_usable_games": 0,
+    }
 
-        for lg in leagues:
-            league_id = lg["id"]
-            league_name = lg["name"]
+    for country in COUNTRIES:
+        leagues = get_leagues_for_country(country)
 
-            season = get_latest_season(league_id)
+        for league_id, league_name in leagues:
+            season = get_latest_season_for_league(league_id)
             if not season:
                 continue
 
+            diag["leagues_used"] += 1
+
             teams = get_teams(league_id, season)
-            if not teams:
-                continue
+            for team_id, team_name in teams:
+                diag["teams_scanned"] += 1
 
-            for team in teams:
-                team_id = team["id"]
-                team_name = team["name"]
-
-                games = get_team_games(league_id, season, team_id)
+                games = get_last_games(team_id, league_id, season)
                 if not games:
                     continue
 
-                streak, freq = streak_and_freq(games)
+                streak, hits, usable = calc_active_streak_and_freq(games)
 
-                # нужны только активные серии
-                if streak > 0:
-                    all_rows.append({
-                        "streak": streak,
-                        "freq": freq,
-                        "team": team_name,
-                        "league": f"{country} — {league_name}"
-                    })
+                if usable > 0:
+                    diag["teams_with_usable"] += 1
+                    diag["total_usable_games"] += usable
 
-    # сортируем: сначала по streak, потом по freq
-    all_rows.sort(key=lambda x: (x["streak"], x["freq"]), reverse=True)
+                # ВАЖНО: берём только активные серии (streak>=1)
+                if streak >= 1:
+                    rows.append((streak, hits, usable, team_name, f"{country} — {league_name}"))
 
-    top = all_rows[:10]
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = rows[:TOP_N]
+
+    msg = []
+    msg.append(f"🏀 TOP-{TOP_N} ACTIVE STREAK — total 1Q < 2Q")
+    msg.append(f"🕒 {now}")
+    msg.append(f"Окно: последние {LAST_N} матчей")
+    msg.append("")
 
     if not top:
-        send_telegram("Сегодня нет команд с активной серией по условию: total 1q < 2q")
-        return
+        msg.append("⚠️ НЕ НАЙДЕНО активных серий (streak>=1).")
+        msg.append("")
+        msg.append("Диагностика данных:")
+        msg.append(f"- Лиг просмотрено: {diag['leagues_used']}")
+        msg.append(f"- Команд просмотрено: {diag['teams_scanned']}")
+        msg.append(f"- Команд с данными Q1/Q2: {diag['teams_with_usable']}")
+        msg.append(f"- Всего матчей с Q1/Q2: {diag['total_usable_games']}")
+        msg.append("")
+        msg.append("Если команд с данными Q1/Q2 почти нет — проблема в том, что API по этим лигам/сезонам не отдаёт четверти.")
+    else:
+        for i, (streak, hits, usable, team, league) in enumerate(top, start=1):
+            msg.append(f"{i}) streak {streak} | freq {hits}/{usable} — {team} ({league})")
 
-    msg = "🏀 ТОП-10 active streak (total 1q < 2q)\n\n"
-    for i, row in enumerate(top, start=1):
-        msg += f"{i}) streak={row['streak']} | freq={row['freq']}/15 | {row['team']} | {row['league']}\n"
+        msg.append("")
+        msg.append("Диагностика данных:")
+        msg.append(f"- Лиг просмотрено: {diag['leagues_used']}")
+        msg.append(f"- Команд просмотрено: {diag['teams_scanned']}")
+        msg.append(f"- Команд с данными Q1/Q2: {diag['teams_with_usable']}")
+        msg.append(f"- Всего матчей с Q1/Q2: {diag['total_usable_games']}")
 
-    send_telegram(msg)
+    send_telegram("\n".join(msg))
 
 
 if __name__ == "__main__":
